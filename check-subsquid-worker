@@ -1,0 +1,248 @@
+#!/usr/local/lib/check-subsquid-worker/bin/python
+# (c) 2023–2024 cardinate.io / CARSAT GmbH & Co. KG
+from dataclasses import dataclass
+import json
+from math import floor
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+import requests
+from datetime import datetime, timedelta
+
+from dotenv import load_dotenv
+
+PINGS_URL = "https://scheduler.testnet.subsquid.io/workers/pings"
+CHUNKS_URL = "https://scheduler.testnet.subsquid.io/chunks"
+METRICS_URL = "https://app.subsquid.io/network/api/metrics/testnet/workers"
+DEFAULT_WORKERS_DIR = "/var/lib/check-subsquid-worker"
+
+S_OK = 0
+S_WARN = 1
+S_FAIL = 2
+S_UNKOWN = 3
+
+def sizeof_fmt(num, suffix="B"):
+    for unit in ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"):
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.1f}Yi{suffix}"
+
+
+def get_workers() -> Dict[str, str]:
+    """
+    Get a mapping from worker name to worker id
+    """
+    return {f.name: f.read_text().strip() for f in Path(os.getenv("SUBSQUID_WORKERS_DIR") or DEFAULT_WORKERS_DIR).iterdir() if f.is_file()}
+
+def format_result(status: int, metrics: dict, description: str, title: str = 'SubsquidWorker'):
+    metric_description = '|'.join([f'{key}={value}' for key, value in metrics.items()]) or '-'
+    return f'{status} "{title}" {metric_description} {description.encode("unicode_escape").decode("utf-8")}'
+
+
+@dataclass
+class WorkerChunks:
+    assigned_count: int = 0
+    assigned_size: int = 0
+    downloaded_count: int = 0
+    downloaded_size: int = 0
+
+@dataclass
+class WorkerStatus:
+    id: str
+    last_ping: datetime
+    version: str
+    stored_bytes: int
+    jailed: bool
+    response_bytes: Optional[int] = None
+    chunks: WorkerChunks = WorkerChunks()
+
+    def metrics(self) -> dict:
+        return {
+            "stored_bytes": self.stored_bytes,
+            "assigned_chunks_count": self.chunks.assigned_count,
+            "assigned_chunks_size": self.chunks.assigned_size,
+            "downloaded_chunks_count": self.chunks.downloaded_count,
+            "downloaded_chunks_size": self.chunks.downloaded_size
+        } 
+
+
+def format_response_bytes(bytes: Optional[int]) -> Optional[str]:
+    if bytes is None:
+        return
+    return format_result(S_OK if bytes > 0 else S_WARN, {"response_bytes": bytes}, f"{sizeof_fmt(bytes)} responses sent to Squids", title="SubsquidWorkerResponseTraffic")
+    
+def format_status(status: WorkerStatus, cached: bool) -> Tuple[str, Optional[str]]:
+    judgement = "request failed, data might be stale" if cached else "ok" 
+    chk_mk_status = S_WARN if cached else S_OK
+    if status.jailed:
+        judgement = 'worker jailed'
+        chk_mk_status = S_FAIL
+    elif datetime.now() - status.last_ping > timedelta(hours=6):
+        judgement = 'No ping for more than 6 hours'
+        chk_mk_status = S_FAIL
+    elif datetime.now() - status.last_ping > timedelta(hours=1):
+        judgement = 'No ping for more than 1 hour' 
+        chk_mk_status = S_FAIL
+    elif status.chunks.assigned_count == 0:
+        judgement = 'No chunks assigned'
+        chk_mk_status = S_FAIL
+    elif float(status.chunks.downloaded_count) / float(status.chunks.assigned_count) < 0.1:
+        judgement = 'Less than 10% of all chunks downloaded'
+        chk_mk_status = S_FAIL
+    elif float(status.chunks.downloaded_count) / float(status.chunks.assigned_count) < 0.75:
+        judgement = 'Less than 75% of all chunks downloaded'
+        chk_mk_status = S_WARN
+
+    worker_text = f'{judgement} - {status.id} - version: {status.version} - last ping: {status.last_ping.isoformat()} - chunks downloaded: {status.chunks.downloaded_count}/{status.chunks.assigned_count} - stored data: {sizeof_fmt(status.stored_bytes)}{" (cached)" if cached else ""}'
+    return format_result(chk_mk_status, status.metrics(), worker_text), format_response_bytes(status.response_bytes)
+
+
+def format_worker(name: str, status: Union[str, WorkerStatus], cached: bool) -> str:
+    if isinstance(status, WorkerStatus):
+        status, response_item = format_status(status, cached)
+    else:
+        response_item = None
+    return os.linesep.join([x for x in [f'<<<<{name}>>>>', '<<<local>>>', status, response_item, '<<<<>>>>'] if x is not None])
+
+
+def format_workers(workers: Dict[str, Union[str, WorkerStatus]], cached: bool) -> List[str]:
+    worker_list = list(workers.items())
+    worker_list.sort(key=lambda x: x[0])
+    return [format_worker(k, v, cached) for k, v in worker_list]
+
+def print_workers(workers: Dict[str, Union[str, WorkerStatus]], cached = False) -> None:
+    for w in format_workers(workers, cached):
+        print(w)
+
+def cache_dir():
+    cache_dir = Path(os.getenv("SUBSQUID_WORKERS_DIR") or DEFAULT_WORKERS_DIR) / '.cache'
+    if not cache_dir.exists():
+        cache_dir.mkdir()
+    return cache_dir
+
+def update_manifest(name: str):
+    manifest = cache_dir() / 'manifest.json'
+    if manifest.exists():
+        with manifest.open('r') as fp:
+            manifest_data = json.load(fp)
+    else:
+        manifest_data = {}
+    manifest_data[name] = int(floor(datetime.now().timestamp()))
+    with manifest.open('w') as fp:
+        json.dump(manifest_data, fp)
+
+def manifest_age(name: str) -> datetime:
+    manifest = cache_dir() / 'manifest.json'
+    if manifest.exists():
+        with manifest.open('r') as fp:
+            return datetime.fromtimestamp(json.load(fp).get(name) or 0.)
+    return 0.
+
+def write_cache(name: str, data: Any):
+    if name == 'manifest':
+        raise Exception('Name lot allowed')
+    with (cache_dir() / name).open('w') as fp:
+        json.dump(data, fp)
+        update_manifest(name)
+
+def read_cache(name: str):
+    file = cache_dir() / name
+    if file.exists() and (datetime.now() - manifest_age(name)) < timedelta(minutes=10):
+        with file.open("r") as fp:
+            return json.load(fp)
+    return None
+    
+def main():
+    cached = False
+    workers = get_workers()
+    workers_by_id = {v: k for k, v in workers.items()}
+    worker_ids = set(workers_by_id.keys())
+    try:
+        pings = requests.get(PINGS_URL,  verify=True, timeout=float(os.getenv('SUBSQUID_PING_TIMEOUT', 30)))
+        pings.raise_for_status()
+    except:
+        ping_data = read_cache('pings')
+        cached = True
+        if ping_data is None:
+            print_workers({k: format_result(S_UNKOWN, {}, "Could not query Subsquid scheduler") for k, _ in workers.items()})
+            return
+    else:
+        write_cache('pings', pings.json())
+        ping_data = pings.json()
+
+    worker_statuses: Dict[str, Union[str, WorkerStatus]] = {}
+
+    for ping in ping_data:
+        if len(worker_statuses) == len(workers):
+            # Got all workers
+            break
+
+        worker_id = ping['peer_id']
+        worker_name = workers_by_id.get(worker_id)
+        if worker_name is None:
+            # not one of ours
+            continue
+        worker_statuses[worker_name] = WorkerStatus(
+            worker_id,
+            datetime.fromtimestamp(ping['last_ping'] / 1000.0).replace(microsecond=0),
+            ping['version'],
+            ping['stored_bytes'],
+            ping['jailed'], 
+            )
+    
+    if len(worker_statuses) != len(workers):
+        for k, v in workers.items():
+            if not k in worker_statuses:
+                worker_statuses[k] = format_result(S_FAIL, {}, "Worker not active")
+
+    try:
+        chunks = requests.get(CHUNKS_URL, verify=True, timeout=float(os.getenv('SUBSQUID_CHUNKS_TIMEOUT', 30)))
+        chunks.raise_for_status()
+    except:
+        chunk_data = read_cache("chunks")
+        cached = True
+        if chunk_data is None:
+            print_workers({k: format_result(S_UNKOWN, {}, "Could not retrieve statistics") for k, _ in workers.items()})
+            return
+    else:
+        chunk_data = chunks.json()
+        write_cache("chunks", chunk_data)
+    
+    for ds_chunks in chunk_data.values():
+        for chunk in ds_chunks:
+            assigned_ids = worker_ids.intersection(set(chunk['assigned_to'])) 
+            downloaded_ids = worker_ids.intersection(set(chunk['downloaded_by']))
+            for worker_id in assigned_ids:
+                if not isinstance(worker_statuses[workers_by_id[worker_id]], WorkerStatus):
+                    continue
+                worker_statuses[workers_by_id[worker_id]].chunks.assigned_count += 1
+                worker_statuses[workers_by_id[worker_id]].chunks.assigned_size += chunk['size_bytes']
+            for worker_id in downloaded_ids:
+                if not isinstance(worker_statuses[workers_by_id[worker_id]], WorkerStatus):
+                    continue
+                worker_statuses[workers_by_id[worker_id]].chunks.downloaded_count += 1
+                worker_statuses[workers_by_id[worker_id]].chunks.downloaded_size += chunk['size_bytes']
+    
+    try:
+        metrics = requests.get(METRICS_URL, timeout=float(os.getenv('SUBSQUID_METRICS_TIMEOUT', 30)))
+        metrics.raise_for_status()
+        if metrics.json()['error'] is not None:
+            raise Exception(metrics.json()['error'])
+    except:
+        metrics_data = read_cache("metrics") or {"payload": []}
+        cached = True
+    else:
+        metrics_data = metrics.json()
+        write_cache("metrics", metrics_data)
+    
+    for instance_data in metrics_data['payload']:
+        worker_id = instance_data['p2pAddress']
+        if worker_id in worker_ids and not isinstance(worker_statuses[workers_by_id[worker_id]], str):
+            worker_statuses[workers_by_id[worker_id]].response_bytes = int(instance_data['responseBytes'])
+
+    print_workers(worker_statuses, cached)
+
+if __name__ == '__main__':
+    load_dotenv("/etc/default/check-subsquid-worker")
+    main()
